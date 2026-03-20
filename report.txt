@@ -1,0 +1,234 @@
+                    MULTI-TASTE PREDICTOR — PROJECT REPORT
+
+Build a multiclass deep learning classifier that predicts the taste property of
+molecules (Sweet, Bitter, Umami, Sour, Undefined) directly from their chemical
+structure, using learned molecular embeddings.
+
+    new model/
+    ├── filtered_db.csv              Final cleaned dataset (12,823 rows)
+    ├── chemtastes_cleaned_full.csv  ChemTastesDB after initial cleaning
+    ├── data3.ipynb                  Embedding generation & preprocessing
+    ├── eda3.ipynb                   Exploratory data analysis
+    ├── EDA_Report.md                EDA summary report
+    ├── modelv3.ipynb                Main DL model (multiclass MLP)
+    ├── baseline_model.ipynb         10 baseline models × 5 embeddings
+    ├── exp3.ipynb                   Experiments notebook
+    ├── results_table.csv            Baseline results (all combinations)
+    ├── taste_classifier_model.pth   Saved model checkpoint
+    ├── taste_mapping.json           Class name mapping
+    └── embeddings/
+        ├── mol2vec.csv              12,822 × 300
+        ├── chemberta.csv            12,823 × 768
+        ├── rdkit_descriptors.csv    12,823 × 144
+        ├── morgan_fps.csv           12,823 × 585
+        └── maccs.csv                12,823 × 161
+
+1. DATASET PREPARATION
+
+1.1  Source: FartDB
+
+    Source                     Approx. Contribution
+    ─────────────────────────  ─────────────────────
+    FlavorDB                   ~6,794
+    ChemTastesDB               ~1,447 (original subset)
+    IUPAC Dissociation Const.  ~1,408
+    PhytoCompoundsDB           ~693
+    TAS2R Agonists             ~32
+
+FartDB was taken as the starting reference. Peptides and amino acid sequences
+were removed from the dataset since this project focuses on small-molecule
+tastants; peptide SMILES are not well represented by the fingerprint and
+embedding methods used here. 
+
+1.2  ChemTastesDB Manual Re-integration
+----------------------------------------
+Upon inspection of FartDB, it was observed that many molecules from ChemTastesDB
+appeared to not have been included. Specifically, entries categorised as salty,
+non-bitter, non-sweet, and several multitaste compounds were missing from the
+FartDB version of ChemTastesDB. To address this:
+
+  1. The original ~1,447 ChemTastesDB rows in FartDB were removed.
+  2. ChemTastesDB was independently cleaned (4,075 rows after dropping missing
+     values and deduplicating SMILES).
+  3. 179 ambiguous "Multitaste" rows were removed.
+  4. Taste labels were remapped:
+       Sweetness          → sweet
+       Bitterness         → bitter
+       Umaminess          → umami
+       Sourness           → sour
+       Saltiness          → undefined
+       Tastelessness      → undefined
+       Non-sweetness      → undefined
+       Non-bitterness     → undefined
+       Miscellaneous      → undefined
+  5. The resulting 3,896 ChemTastesDB rows were added back into the dataset.
+
+This re-integration substantially improved coverage, particularly for the
+Umami class (from ~30 to ~220 samples).
+
+1.3  Final Dataset Statistics
+-----------------------------
+    Total molecules:   12,822 (after alignment across embeddings)
+    Taste classes:     5 (single-label multiclass)
+    Label source:      Canonicalized Taste column, argmax for single-label
+
+    CLASS DISTRIBUTION:
+    ┌───────────┬────────┬────────────┐
+    │ Class     │ Count  │ Percentage │
+    ├───────────┼────────┼────────────┤
+    │ Sweet     │ ~6,473 │   50.5%    │
+    │ Undefined │ ~2,398 │   18.7%    │
+    │ Bitter    │ ~2,210 │   17.2%    │
+    │ Sour      │ ~1,522 │   11.9%    │
+    │ Umami     │   ~220 │    1.7%    │
+    └───────────┴────────┴────────────┘
+
+    ⚠ Severe class imbalance — Sweet dominates at 50.5%, Umami is critically
+      underrepresented at 1.7%. Addressed via class-weighted loss.
+
+NOTES 
+    - Most amino acids and peptides should have been removed but some might 
+    still be present since a heuristic based solution was used to remove them.
+    - ChemTastesDB class confusion(how to include non-bitter, non-sweet, etc)
+    - Undefined class is ambiguous. It contains compounds whose taste could 
+    not be detected reliable, multitaste compounds, flavors such as salty that
+    we are not working with, etc. It must be handled in some way because it would
+    confuse the model
+
+
+2. EMBEDDING GENERATION
+
+Five molecular representations were generated from the cleaned dataset:
+
+    Embedding          Dimensions   Type          Notes
+    ─────────────────  ──────────   ───────────   ─────────────────────────
+    Mol2Vec            300          Continuous     Pre-trained Word2Vec on
+                                                   molecular substructures
+    ChemBERTa          768          Continuous     Transformer [CLS] token
+                                                   (seyonec/ChemBERTa-zinc-
+                                                   base-v1)
+    RDKit 2D Desc.     144*         Continuous     Physicochemical desc.
+    Morgan FP          585*         Binary         Circular FP (radius=2)
+    MACCS Keys         161*         Binary         Structural key bits
+
+    * After preprocessing: zero-variance removal, high-correlation removal
+      (r > 0.95), rare-bit filtering (<0.1% for Morgan), outlier clipping
+      (1–99th percentile for RDKit), median imputation, and standardisation
+      where appropriate.
+
+
+3. EXPLORATORY DATA ANALYSIS — KEY FINDINGS
+
+3.1  Feature–Taste Correlations
+    Best embedding per taste:
+    • Sweet    → Morgan FP   (max r = 0.626, bits 1921, 1487)
+    • Sour     → RDKit       (max r = 0.563, fr_COO, fr_COO2)
+    • Bitter   → RDKit       (max r = 0.384, SMR_VSA4, PEOE_VSA7)
+    • Umami    → Morgan FP   (max r = 0.410, bits 1798, 633)
+    • Undefined→ MACCS       (max r = 0.484, bits 146, 140)
+
+3.2  Embedding Quality
+    • Mol2Vec and ChemBERTa: clean, no missing values.
+    • RDKit: required NaN/Inf handling, outlier clipping, robust scaling.
+    • Morgan FP: extremely sparse (98.4%); rare bits filtered.
+    • MACCS: 6 zero-variance bits removed.
+
+
+4. ARCHITECTURAL SHIFT: FROM MULTI-LABEL TO SINGLE-LABEL MULTICLASS
+
+PREVIOUS APPROACH (modelv2 and earlier):
+    • Multi-label binary classification (multi-hot targets [N, 5]).
+    • Per-label sigmoid output heads (5 independent binary classifiers).
+    • Focal Loss with per-label pos_weight.
+    • Metrics: per-label AUROC, per-label F1, exact-match accuracy.
+    • Multi-branch architecture: separate branches for embeddings vs
+      fingerprints, fused via concatenation.
+
+    Problems observed:
+    ─ Significant overfitting (train loss ~0.08, val loss ~0.58).
+    ─ Architecture complexity with multi-branch fusion added noise.
+    ─ Only ~7.4% of molecules are genuinely multi-label; the overwhelming
+      majority (78%) have exactly one taste label.
+    ─ Multi-label framing forced the model to learn 5 independent binary
+      decisions, losing inter-class competition signals.
+
+CURRENT APPROACH (modelv3):
+    • Single-label multiclass classification (argmax targets [N]).
+    • Single shared MLP backbone with ONE classification head outputting
+      logits of shape [B, 5].
+    • CrossEntropyLoss with inverse-frequency class weights (sqrt smoothing).
+    • Softmax probabilities → argmax prediction.
+    • Metrics: accuracy, macro F1, weighted F1, classification_report,
+      single confusion matrix.
+
+    Rationale for the shift:
+    ─ Dataset is overwhelmingly single-label (78% have exactly 1 taste).
+    ─ CrossEntropyLoss enforces mutual exclusivity, giving the model a
+      stronger learning signal through inter-class competition.
+    ─ Simpler architecture is less prone to overfitting.
+    ─ Aligns with the approach used in related literature (FartDB paper
+      uses an "undefined" catch-all class for multitaste/ambiguous entries).
+
+4.1  modelv3.ipynb — Architecture Details
+
+    Input:    Mol2Vec (300d) + ChemBERTa (768d) = 1,068 features
+    Backbone: Linear(1068→512) → BN → ReLU → Dropout(0.3)
+              Linear(512→256)  → BN → ReLU → Dropout(0.3)
+              Linear(256→128)  → BN → ReLU → Dropout(0.3)
+    Head:     Linear(128→5)
+
+    Loss:      CrossEntropyLoss(weight=class_weights)
+    Optimizer: AdamW (lr=1e-3, weight_decay=1e-4)
+    Scheduler: ReduceLROnPlateau (factor=0.5, patience=5)
+    Early Stop: patience=15 on validation macro F1
+    Split:     70% train / 15% val / 15% test (stratified)
+    Batch:     32
+
+
+5. BASELINE MODEL EVALUATION (baseline_model.ipynb)
+
+Ten baseline models were evaluated across all five embeddings (50 total
+model–embedding combinations). Each combination was trained and tested using
+an 80/20 stratified split with identical random seed.
+
+5.1  Sklearn Models (8 models)
+
+    Model                Scaling   Key Hyperparameters
+    ───────────────────  ────────  ─────────────────────────────────
+    Logistic Regression  Yes       max_iter=2000, solver=lbfgs
+    Decision Tree        No        default
+    Random Forest        No        n_estimators=300
+    Extra Trees          No        n_estimators=300
+    Gradient Boosting    No        n_estimators=200, lr=0.1, depth=5
+    AdaBoost             No        n_estimators=200, lr=0.1
+    XGBoost              No        n_estimators=300, lr=0.1, depth=6
+    SVM (RBF)            Yes       kernel=rbf, OvR
+
+5.2  Deep Sequence Models (2 models)
+
+    Model    Architecture                              Training
+    ───────  ────────────────────────────────────────  ────────────────────
+    BiGRU    Bidirectional GRU (2 layers, hidden=128)  AdamW, lr=1e-3,
+             → Dropout(0.3) → Linear(256→5)            CE loss (weighted),
+    BiLSTM   Bidirectional LSTM (2 layers, hidden=128)  early stop on val
+             → Dropout(0.3) → Linear(256→5)            macro F1 (pat=15)
+
+5.3  Evaluation Metrics (per combination)
+
+    Train and Test metrics recorded for each model–embedding pair:
+    • ACC  — Accuracy
+    • PRE  — Precision (macro)
+    • SPEC — Specificity (macro, from confusion matrix)
+    • SENS — Sensitivity / Recall (macro)
+    • F1   — F1 Score (macro)
+    • MCC  — Matthews Correlation Coefficient
+
+    Full results saved to: results_table.csv
+
+
+6. NEXT STEPS
+    1. Address Umami underrepresentation 
+    2. Hyperparameter tuning (hidden dims, dropout, LR schedule).
+    3. Experiment with different embeddings and models
+    4. SHAP based interpretability analysis.
+
